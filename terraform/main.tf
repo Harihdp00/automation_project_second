@@ -6,12 +6,13 @@ terraform {
   backend "local" {}
 }
 
-provider "aws" { region = var.aws_region }
+provider "aws" {
+  region = var.aws_region
+}
 
-# =====================================================================
+# -----------------------------------------------------
 # SSH Key Generation
-# =====================================================================
-
+# -----------------------------------------------------
 resource "tls_private_key" "ansible_key" {
   algorithm = "RSA"
   rsa_bits  = 4096
@@ -34,12 +35,14 @@ locals {
 
   jenkins_admin_user = var.jenkins_admin_user
   jenkins_admin_pass = var.jenkins_admin_password
+
+  root_pass  = var.root_password
+  devops_pass = var.devops_password
 }
 
-# =====================================================================
-# NETWORKING
-# =====================================================================
-
+# -----------------------------------------------------
+# Networking (VPC/Subnet/IGW/RT)
+# -----------------------------------------------------
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -53,7 +56,7 @@ resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
   map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[0]
+  availability_zone       = element(data.aws_availability_zones.available.names, 0)
   tags = { Name = "${var.prefix}-public" }
 }
 
@@ -78,13 +81,12 @@ resource "aws_route_table_association" "public_assoc" {
   route_table_id = aws_route_table.public.id
 }
 
-# =====================================================================
-# SECURITY GROUP
-# =====================================================================
-
+# -----------------------------------------------------
+# Security Group (SSH & Jenkins 8080)
+# -----------------------------------------------------
 resource "aws_security_group" "nodes_sg" {
   name        = "${var.prefix}-sg"
-  description = "Allow SSH and Jenkins"
+  description = "Allow SSH and Jenkins UI; JNLP limited to VPC"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -92,7 +94,7 @@ resource "aws_security_group" "nodes_sg" {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] # Consider restricting to your IP
   }
 
   ingress {
@@ -104,7 +106,7 @@ resource "aws_security_group" "nodes_sg" {
   }
 
   ingress {
-    description = "JNLP port (internal)"
+    description = "JNLP (agent) inside VPC"
     from_port   = 50000
     to_port     = 50000
     protocol    = "tcp"
@@ -121,98 +123,84 @@ resource "aws_security_group" "nodes_sg" {
   tags = { Name = "${var.prefix}-sg" }
 }
 
-# =====================================================================
+# -----------------------------------------------------
 # AMI
-# =====================================================================
-
+# -----------------------------------------------------
 data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["099720109477"]
-
+  owners      = ["099720109477"] # Canonical
   filter {
     name   = "name"
     values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
 }
 
-# =====================================================================
-# CLOUD-INIT COMMON BASE (devops user + hardening)
-# =====================================================================
+# -----------------------------------------------------
+# Cloud-init / user_data templates
+# - NO UFW
+# - NO fail2ban
+# - SSH config allows PasswordAuthentication and PermitRootLogin
+# - set root and devops passwords
+# -----------------------------------------------------
 
 locals {
   base_userdata = <<-EOT
     #!/bin/bash
     set -ex
-
     export DEBIAN_FRONTEND=noninteractive
 
     apt-get update -y
     apt-get upgrade -y
 
-    apt-get install -y curl wget git python3 python3-pip ufw fail2ban \
-      software-properties-common apt-transport-https ca-certificates
+    apt-get install -y curl wget git python3 python3-pip software-properties-common apt-transport-https ca-certificates
 
-    # Create devops user
-    useradd -m -s /bin/bash devops || true
+    # Create devops user if missing
+    if ! id -u devops >/dev/null 2>&1; then
+      useradd -m -s /bin/bash devops
+    fi
+
+    # Put public key for devops
     mkdir -p /home/devops/.ssh
     echo "${local.devops_public_key}" > /home/devops/.ssh/authorized_keys
     chmod 700 /home/devops/.ssh
     chmod 600 /home/devops/.ssh/authorized_keys
     chown -R devops:devops /home/devops/.ssh
-    usermod -aG sudo devops
 
-    # SSH hardening
-    sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-    sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-    echo "AllowUsers devops" >> /etc/ssh/sshd_config
-    systemctl reload sshd
+    # Set devops password (so you can sudo or SSH with password)
+    echo "devops:${local.devops_pass}" | chpasswd
 
-    # UFW
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow 22/tcp
-    ufw allow from 10.0.0.0/16
-    ufw --force enable
+    # Set root password
+    echo "root:${local.root_pass}" | chpasswd
 
-    # fail2ban
-    cat > /etc/fail2ban/jail.local <<'EOF'
-    [sshd]
-    enabled = true
-    port = ssh
-    logpath = /var/log/auth.log
-    bantime = 3600
-    maxretry = 5
-    EOF
+    # Adjust sshd_config: enable password auth and permit root login
+    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
 
-    systemctl enable --now fail2ban
+    # Remove any AllowUsers lines (allow all)
+    sed -i '/^AllowUsers/d' /etc/ssh/sshd_config || true
+
+    systemctl reload sshd || true
   EOT
-}
 
-# =====================================================================
-# CONTROL NODE (ANSIBLE AUTO-RUN)
-# =====================================================================
-
-locals {
   control_userdata = <<-EOT
     ${local.base_userdata}
 
-    # Install ansible
+    # Install Ansible
     apt-get install -y ansible sshpass python3-apt
 
+    # Write private key for ansible use (note: security risk for production)
     mkdir -p /home/devops/.ssh
-
-    # Write private key for ansible use
     cat > /home/devops/.ssh/ansible_key.pem <<'KEY'
 ${local.devops_private_key}
 KEY
     chmod 600 /home/devops/.ssh/ansible_key.pem
     chown devops:devops /home/devops/.ssh/ansible_key.pem
 
+    # Prepare ansible workspace
     mkdir -p /home/devops/ansible
     chown devops:devops /home/devops/ansible
 
-    # Generate inventory
+    # Generate inventory using private IPs (injected by Terraform)
     cat > /home/devops/ansible/inventory.ini <<'INV'
 [jenkins_master]
 ${aws_instance.jenkins_master.private_ip} ansible_user=devops
@@ -223,29 +211,33 @@ ${aws_instance.jenkins_worker.private_ip} ansible_user=devops
 [all:vars]
 ansible_ssh_private_key_file=/home/devops/.ssh/ansible_key.pem
 INV
-
     chown devops:devops /home/devops/ansible/inventory.ini
+    chmod 600 /home/devops/ansible/inventory.ini
 
-    # Playbook (NO DOCKER EXCEPT ON WORKER)
+    # Create Ansible playbook: install Java on worker; copy key+workerip to master; DOCKER installed only on worker
     cat > /home/devops/ansible/site.yml <<'PLAY'
 ---
-# -----------------------------
-# WORKER CONFIG (Java + Docker)
-# -----------------------------
-- name: Prepare Jenkins worker
+- name: Configure Jenkins worker (Java + Docker)
   hosts: jenkins_worker
   become: yes
   tasks:
-    - name: install Java
+    - name: update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: install openjdk
       apt:
         name: openjdk-11-jdk
         state: present
         update_cache: yes
 
-    - name: install docker
+    - name: install docker using get.docker.com
       shell: |
         curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
         sh /tmp/get-docker.sh
+      args:
+        creates: /usr/bin/dockerd
 
     - name: add devops to docker group
       user:
@@ -253,21 +245,19 @@ INV
         groups: docker
         append: yes
 
-# -----------------------------
-# MASTER CONFIG (SSH Credential)
-# -----------------------------
-- name: Prepare Jenkins master
+- name: Configure Jenkins master (place private key and worker ip to trigger bootstrap)
   hosts: jenkins_master
   become: yes
   tasks:
-    - name: create jenkins dir
+    - name: ensure /var/lib/jenkins exists
       file:
         path: /var/lib/jenkins
         state: directory
         owner: jenkins
         group: jenkins
+        mode: '0755'
 
-    - name: copy private key to master
+    - name: copy devops private key to master for jenkins bootstrap
       copy:
         src: /home/devops/.ssh/ansible_key.pem
         dest: /var/lib/jenkins/devops_id_rsa
@@ -275,120 +265,103 @@ INV
         group: jenkins
         mode: '0600'
 
-    - name: write worker IP
+    - name: write worker private IP for jenkins bootstrap
       copy:
-        content: "{{ hostvars[groups['jenkins_worker'][0]].ansible_host }}"
+        content: "{{ hostvars[groups['jenkins_worker'][0]]['ansible_host'] | default(hostvars[groups['jenkins_worker'][0]]['inventory_hostname']) | default('') }}"
         dest: /var/lib/jenkins/worker_ip
         owner: jenkins
         group: jenkins
         mode: '0644'
 PLAY
-
     chown devops:devops /home/devops/ansible/site.yml
+    chmod 644 /home/devops/ansible/site.yml
 
-    # Auto run ansible
-    su - devops -c "ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i /home/devops/ansible/inventory.ini /home/devops/ansible/site.yml" \
-      > /var/log/ansible-autorun.log 2>&1 || true
+    # Run Ansible automatically
+    su - devops -c "ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i /home/devops/ansible/inventory.ini /home/devops/ansible/site.yml" > /var/log/ansible-autorun.log 2>&1 || true
+    touch /home/devops/ansible/.autorun_complete
   EOT
-}
 
-# =====================================================================
-# JENKINS MASTER CLOUD-INIT (Admin + Bootstrap)
-# =====================================================================
-
-locals {
+  # Jenkins master userdata: installs Jenkins + admin, plus bootstrap script that reads /var/lib/jenkins/devops_id_rsa and /var/lib/jenkins/worker_ip
   jenkins_master_userdata = <<-EOT
     ${local.base_userdata}
 
     apt-get install -y openjdk-11-jdk gnupg
 
-    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
-      | tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
-
-    echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
-      https://pkg.jenkins.io/debian-stable binary/ \
-      > /etc/apt/sources.list.d/jenkins.list
-
+    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+    echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list
     apt-get update -y
     apt-get install -y jenkins
 
     mkdir -p /var/lib/jenkins/init.groovy.d
+    chown -R jenkins:jenkins /var/lib/jenkins
 
-    # Create admin user
-    cat > /var/lib/jenkins/init.groovy.d/00_admin.groovy <<'GROOVY'
+    # create admin user
+    cat > /var/lib/jenkins/init.groovy.d/00_create_admin.groovy <<'GROOVY'
     import jenkins.model.*
     import hudson.security.*
     def instance = Jenkins.getInstance()
-    def realm = new HudsonPrivateSecurityRealm(false)
-    realm.createAccount("${local.jenkins_admin_user}", "${local.jenkins_admin_pass}")
-    instance.setSecurityRealm(realm)
-    instance.setAuthorizationStrategy(new FullControlOnceLoggedInAuthorizationStrategy())
+    def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+    hudsonRealm.createAccount("${local.jenkins_admin_user}", "${local.jenkins_admin_pass}")
+    instance.setSecurityRealm(hudsonRealm)
+    def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+    instance.setAuthorizationStrategy(strategy)
     instance.save()
     GROOVY
 
-    chmod 644 /var/lib/jenkins/init.groovy.d/00_admin.groovy
-    chown -R jenkins:jenkins /var/lib/jenkins
+    chown jenkins:jenkins /var/lib/jenkins/init.groovy.d/00_create_admin.groovy
+    chmod 644 /var/lib/jenkins/init.groovy.d/00_create_admin.groovy
 
-    # Jenkins bootstrap → create SSH credential + node
+    # bootstrap helper script - create credentials & node when /var/lib/jenkins/devops_id_rsa and /var/lib/jenkins/worker_ip exist
     cat > /usr/local/bin/jenkins-bootstrap.sh <<'BOOT'
     #!/bin/bash
     set -e
-
     for i in {1..60}; do
       if curl -sSf http://localhost:8080/login >/dev/null 2>&1; then break; fi
       sleep 5
     done
 
     CLI=/tmp/jenkins-cli.jar
-    wget -q -O $CLI http://localhost:8080/jnlpJars/jenkins-cli.jar
+    wget -q -O $CLI http://localhost:8080/jnlpJars/jenkins-cli.jar || true
 
     PRIV="/var/lib/jenkins/devops_id_rsa"
     WORKER="/var/lib/jenkins/worker_ip"
 
-    if [[ ! -f "$PRIV" || ! -f "$WORKER" ]]; then exit 0; fi
+    if [[ ! -f "$PRIV" || ! -f "$WORKER" ]]; then
+      echo "bootstrap: missing files; exiting"
+      exit 0
+    fi
 
-    cat > /tmp/create.groovy <<'GROOVY'
+    cat > /tmp/create_creds_node.groovy <<'GROOVY'
     import jenkins.model.*
     import com.cloudbees.plugins.credentials.*
     import com.cloudbees.plugins.credentials.domains.*
     import com.cloudbees.jenkins.plugins.sshcredentials.impl.*
     import hudson.slaves.*
-    def j = Jenkins.getInstance()
+    def instance = Jenkins.getInstance()
     def priv = new File('/var/lib/jenkins/devops_id_rsa').text
     def store = SystemCredentialsProvider.getInstance().getStore()
     def domain = Domain.global()
-
-    def sshCred = new BasicSSHUserPrivateKey(
-      CredentialsScope.GLOBAL,
-      "devops-ssh-cred",
-      "devops",
-      new BasicSSHUserPrivateKey.DirectEntryPrivateKeySource(priv),
-      "",
-      "DevOps SSH Key"
-    )
-
-    store.addCredentials(domain, sshCred)
-
+    def creds = new BasicSSHUserPrivateKey(CredentialsScope.GLOBAL, 'devops-ssh-cred', 'devops', new BasicSSHUserPrivateKey.DirectEntryPrivateKeySource(priv), '', 'Devops key')
+    store.addCredentials(domain, creds)
     def ip = new File('/var/lib/jenkins/worker_ip').text.trim()
-    def launcher = new SSHLauncher(ip, 22, "devops-ssh-cred")
-    def node = new DumbSlave("jenkins-worker", "Auto worker", "/home/devops", "1",
-        Node.Mode.NORMAL, "devops", launcher, new RetentionStrategy.Always(), [])
-
-    j.addNode(node)
-    j.save()
+    if (ip) {
+      def launcher = new hudson.plugins.sshslaves.SSHLauncher(ip, 22, 'devops-ssh-cred')
+      def node = new DumbSlave('jenkins-worker', 'Auto worker', '/home/devops', '1', Node.Mode.NORMAL, 'devops', launcher, new RetentionStrategy.Always(), [])
+      instance.addNode(node)
+    }
+    instance.save()
     GROOVY
 
-    java -jar $CLI -s http://localhost:8080/ \
-      -auth ${local.jenkins_admin_user}:${local.jenkins_admin_pass} \
-      groovy = < /tmp/create.groovy || true
+    java -jar $CLI -s http://localhost:8080/ -auth ${local.jenkins_admin_user}:${local.jenkins_admin_pass} groovy = < /tmp/create_creds_node.groovy || true
     BOOT
 
     chmod +x /usr/local/bin/jenkins-bootstrap.sh
 
     cat > /etc/systemd/system/jenkins-bootstrap.service <<'SERV'
     [Unit]
-    Description=Jenkins bootstrap (credentials + worker)
+    Description=Jenkins bootstrap to create credentials & node
     After=jenkins.service
+    Wants=jenkins.service
 
     [Service]
     Type=oneshot
@@ -400,33 +373,26 @@ locals {
 
     systemctl daemon-reload
     systemctl enable --now jenkins
-    systemctl enable --now jenkins-bootstrap.service
+    systemctl enable --now jenkins-bootstrap.service || true
   EOT
-}
 
-# =====================================================================
-# JENKINS WORKER CLOUD-INIT (Java + Docker)
-# =====================================================================
-
-locals {
+  # jenkins worker: install Java + Docker
   jenkins_worker_userdata = <<-EOT
     ${local.base_userdata}
 
-    # Install Java
     apt-get install -y openjdk-11-jdk
 
-    # Install Docker ONLY on worker
+    # Install Docker on worker only
     curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    sh /tmp/get-docker.sh
+    sh /tmp/get-docker.sh || true
 
-    usermod -aG docker devops
+    usermod -aG docker devops || true
   EOT
 }
 
-# =====================================================================
-# INSTANCES
-# =====================================================================
-
+# -----------------------------------------------------
+# EC2 Instances
+# -----------------------------------------------------
 resource "aws_instance" "jenkins_master" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
@@ -434,7 +400,7 @@ resource "aws_instance" "jenkins_master" {
   vpc_security_group_ids      = [aws_security_group.nodes_sg.id]
   associate_public_ip_address = true
   key_name                    = aws_key_pair.ansible_key.key_name
-  user_data = base64encode(local.jenkins_master_userdata)
+  user_data                   = base64encode(local.jenkins_master_userdata)
   tags = { Name = "${var.prefix}-master" }
 }
 
@@ -445,7 +411,7 @@ resource "aws_instance" "jenkins_worker" {
   vpc_security_group_ids      = [aws_security_group.nodes_sg.id]
   associate_public_ip_address = true
   key_name                    = aws_key_pair.ansible_key.key_name
-  user_data = base64encode(local.jenkins_worker_userdata)
+  user_data                   = base64encode(local.jenkins_worker_userdata)
   tags = { Name = "${var.prefix}-worker" }
 }
 
@@ -456,6 +422,6 @@ resource "aws_instance" "control" {
   vpc_security_group_ids      = [aws_security_group.nodes_sg.id]
   associate_public_ip_address = true
   key_name                    = aws_key_pair.ansible_key.key_name
-  user_data = base64encode(local.control_userdata)
+  user_data                   = base64encode(local.control_userdata)
   tags = { Name = "${var.prefix}-control" }
 }
