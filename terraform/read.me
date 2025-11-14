@@ -1,0 +1,34 @@
+# 🚀 Fully Automated Jenkins + Ansible + Docker Worker (Terraform)
+
+This project automatically provisions:
+
+✔ Jenkins Master  
+✔ Jenkins Worker (with Docker)  
+✔ Ansible Control Node  
+✔ All nodes inside 1 VPC  
+✔ All nodes hardened (UFW + Fail2Ban + SSH hardening)  
+✔ Jenkins worker auto-registers via SSH  
+✔ No manual setup required  
+✔ Fully automated using Terraform + cloud-init + Ansible  
+
+---
+
+## 📦 Infrastructure Created
+
+| Component | Description |
+|----------|-------------|
+| **Control Node** | Runs Ansible automatically, configures all machines |
+| **Jenkins Master** | Auto-installs Jenkins + admin user + auto-bootstrap |
+| **Jenkins Worker** | Auto-installs Java + Docker + auto-registers to master |
+| **Security** | UFW, fail2ban, SSH hardening, sudo devops user |
+| **SSH** | Automatically generated & injected into all nodes |
+
+---
+
+## 🏗 Requirements
+
+- Terraform ≥ 1.4  
+- AWS account  
+- AWS credentials configured locally  
+  ```bash
+  aws configure
