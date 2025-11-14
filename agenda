@@ -1,0 +1,7 @@
+Main agenda is to develop the automation code buttom to top and no manual involvement
+A control node (Ansible node) 
+A Jenkins master 
+A Jenkins worker 
+All connected in one VPC 
+Fully managed via Terraform 
+Free-tier safe using t2.micro and no S3 backend
