@@ -21,3 +21,15 @@ variable "key_private_path" {
   type        = string
   default     = "./ssh/ansible_key.pem"
 }
+
+variable "jenkins_admin_user" {
+  description = "Initial Jenkins admin username created by init script"
+  type        = string
+  default     = "admin"
+}
+
+variable "jenkins_admin_password" {
+  description = "Initial Jenkins admin password (change after first login)"
+  type        = string
+  default     = "ChangeMe123!"   # change this before apply if you want
+}
