@@ -1,0 +1,51 @@
+---
+- name: Install Docker and configure devops user
+  hosts: jenkins_worker
+  become: yes
+  tasks:
+    - name: ensure docker group exists
+      group:
+        name: docker
+        state: present
+
+    - name: install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        update_cache: yes
+
+    - name: add docker official gpg key
+      command: >
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/docker-archive-keyring.gpg
+
+    - name: add docker repo
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        state: present
+
+    - name: install docker packages
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        update_cache: yes
+        state: latest
+
+    - name: add devops user to docker group
+      user:
+        name: devops
+        groups: docker
+        append: yes
+
+    - name: ensure docker service started
+      service:
+        name: docker
+        state: started
+        enabled: yes
