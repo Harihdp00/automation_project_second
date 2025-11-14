@@ -31,5 +31,18 @@ variable "jenkins_admin_user" {
 variable "jenkins_admin_password" {
   description = "Initial Jenkins admin password (change after first login)"
   type        = string
-  default     = "ChangeMe123!"   # change this before apply if you want
+  default     = "ChangeMe123!"
+}
+
+# WARNING: These passwords will be placed in cloud-init. Change before apply if you want.
+variable "root_password" {
+  description = "Root password to set on instances (lab use only)"
+  type        = string
+  default     = "Root@123"
+}
+
+variable "devops_password" {
+  description = "Password to set for devops user (lab use only)"
+  type        = string
+  default     = "Devops@123"
 }
